@@ -1,0 +1,13 @@
+FROM node:20-alpine
+WORKDIR /app
+
+COPY backrend/package*.json ./backrend/
+RUN cd backrend && npm ci --omit=dev
+
+COPY backrend ./backrend
+
+EXPOSE 3000
+ENV NODE_ENV=production
+ENV PORT=3000
+
+CMD ["node", "backrend/index.js"]
