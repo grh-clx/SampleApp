@@ -1,0 +1,86 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  acrName: 'ganesh01acr'                 # your ACR name
+  acrLoginServer: 'ganesh01acr.azurecr.io'
+  imageName: 'devops-demo'
+  resourceGroup: 'ganesh01-rg'
+  aksName: 'ganesh01-aks'
+  azureSubscription: 'AzureSP-REPLACE'   # <<--- REPLACE this with your Azure DevOps service connection name
+
+stages:
+- stage: Build
+  displayName: Build and push image
+  jobs:
+  - job: BuildJob
+    displayName: Build
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    # Use AzureCLI task so the job authenticates to Azure using the service connection
+    - task: AzureCLI@2
+      displayName: ACR Login
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          echo "Logging into ACR: $(acrName)"
+          az acr login --name $(acrName)
+
+    - script: |
+        IMAGE_TAG=$(Build.BuildId)
+        echo "IMAGE_TAG=$IMAGE_TAG" > image.tag
+        echo "Building image: $(acrLoginServer)/$(imageName):$IMAGE_TAG"
+        docker build -t $(acrLoginServer)/$(imageName):$IMAGE_TAG .
+        docker push $(acrLoginServer)/$(imageName):$IMAGE_TAG
+      displayName: Build_and_Push
+
+    - publish: image.tag
+      artifact: imageTag
+
+- stage: Deploy
+  dependsOn: Build
+  jobs:
+  - deployment: DeployToAKS
+    displayName: Deploy to AKS
+    environment: 'aks'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: imageTag
+
+          # Use AzureCLI task so it authenticates to Azure with the service connection
+          - task: AzureCLI@2
+            displayName: Deploy_to_AKS
+            inputs:
+              azureSubscription: '$(azureSubscription)'     # service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                echo "Getting image tag"
+                IMAGE_TAG=$(cat image.tag)
+                echo "IMAGE_TAG=$IMAGE_TAG"
+
+                # get login server from ACR (redundant but safe)
+                ACR_LOGIN=$(az acr show -n $(acrName) -g $(resourceGroup) --query loginServer -o tsv)
+                IMAGE="${ACR_LOGIN}/$(imageName):${IMAGE_TAG}"
+                echo "Image to deploy: $IMAGE"
+
+                # Get AKS credentials (use variables)
+                az aks get-credentials -n $(aksName) -g $(resourceGroup) --overwrite-existing
+
+                # Render k8s manifest with the correct image and apply
+                sed -e "s|REPLACE_WITH_IMAGE|${IMAGE}|g" k8s/deployment.yaml > k8s/deployment_rendered.yaml
+                kubectl apply -f k8s/deployment_rendered.yaml
+                kubectl apply -f k8s/service.yaml
